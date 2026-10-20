@@ -265,9 +265,13 @@ pub(crate) struct OpenCodeSchemaConfig {
 }
 
 impl OpenCodeSchemaConfig {
-    /// Baseline shared by every OpenCode-schema client. Each constructor below
-    /// states only the fields where that client departs from OpenCode itself.
-    const fn base(client: &'static str) -> Self {
+    /// Baseline shared by every OpenCode-schema client. Client-specific
+    /// constructors either live here (when the client is one of the shared
+    /// schema's own) or, for fork-owned clients with their own
+    /// `token_monitor/<id>.rs` module, are built there from this baseline —
+    /// each states only the fields where that client departs from OpenCode
+    /// itself.
+    pub(crate) const fn base(client: &'static str) -> Self {
         Self {
             client,
             query_groups: &[],
@@ -334,29 +338,6 @@ impl OpenCodeSchemaConfig {
             capture_workspace: false,
             dedup: DedupMode::Off,
             ..Self::base("kilo")
-        }
-    }
-
-    /// CodeArts CLI (Huawei Cloud) stores its sessions in OpenCode's own
-    /// schema at `~/.codeartsdoer/codearts-data/opencode.db` — the same
-    /// `message` rows (`$.role`, `$.modelID`, `$.tokens`,
-    /// `$.time.created/completed` in milliseconds) and the same `session`
-    /// join (`directory`, `title`, `time_updated`). Both OpenCode query
-    /// groups are probed so a future CodeArts build that moves to v2
-    /// tables keeps working without a parser change. Two departures from
-    /// OpenCode's own policy: an assistant payload may omit `cache` (or
-    /// its read/write), which a strict requirement would drop; and epoch
-    /// seconds are scaled like MiMo's, because the store is young enough
-    /// that no build has committed to one unit. Zero embedded costs stay
-    /// unpriced (base), so tokscale keeps estimating.
-    pub(crate) const fn codearts() -> Self {
-        Self {
-            query_groups: OPENCODE_QUERY_GROUPS,
-            incremental_groups: Some(OPENCODE_INCREMENTAL_GROUPS),
-            dual_schema: true,
-            strict_cache: false,
-            normalize_epoch_seconds: true,
-            ..Self::base("codearts")
         }
     }
 }
@@ -445,7 +426,7 @@ const OPENCODE_V1_QUERIES: &[&str] = &[
 /// Both OpenCode generations are probed against the same database; whichever
 /// tables exist contribute rows, and the fingerprint dedup collapses any
 /// overlap between them.
-const OPENCODE_QUERY_GROUPS: &[&[&str]] = &[OPENCODE_V2_QUERIES, OPENCODE_V1_QUERIES];
+pub(crate) const OPENCODE_QUERY_GROUPS: &[&[&str]] = &[OPENCODE_V2_QUERIES, OPENCODE_V1_QUERIES];
 
 /// Incremental spelling of [`OPENCODE_V2_QUERIES`], one variant per full
 /// variant and in the same order.
