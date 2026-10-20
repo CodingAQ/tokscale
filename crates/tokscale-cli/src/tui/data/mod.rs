@@ -7,8 +7,9 @@ use tokio::runtime::{Handle, Runtime};
 
 use tokscale_core::sessions::UnifiedMessage;
 use tokscale_core::{
-    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages, sessions,
-    ClientId, GroupBy, LocalParseOptions, ModelPerformance, WorktreeRollup,
+    model_name_for_grouping, normalize_model_for_grouping, parse_local_unified_messages,
+    parse_local_unified_messages_deferred, sessions, ClientId, GroupBy, LocalParseOptions,
+    ModelPerformance, PendingSourceCacheSave, WorktreeRollup,
 };
 
 /// Returns the scanner settings that `DataLoader` should use when building
@@ -173,6 +174,12 @@ pub struct SessionUsage {
     /// (e.g. OpenCode's `session.title` column). `None` for clients that
     /// don't record a title.
     pub title: Option<String>,
+    /// Canonical workspace / project directory path where the session ran.
+    pub workspace_key: Option<String>,
+    /// Friendly workspace / project name when available.
+    pub workspace_label: Option<String>,
+    /// Distinct agent roles observed in this session in first-seen order.
+    pub agents: Vec<String>,
     /// Distinct models used across messages in this session, in first-seen
     /// order. Most sessions use a single model; a few switch mid-conversation.
     pub models: Vec<SessionModel>,
@@ -197,6 +204,9 @@ impl SessionUsage {
             session_id: session_id.to_string(),
             client: client.to_string(),
             title: None,
+            workspace_key: None,
+            workspace_label: None,
+            agents: Vec::new(),
             models: Vec::new(),
             tokens: TokenBreakdown::default(),
             cost: 0.0,
@@ -239,6 +249,17 @@ impl SessionUsage {
         self.last_active_ms = self.last_active_ms.max(branch.last_active_ms);
         if self.title.is_none() {
             self.title = branch.title.clone();
+        }
+        if self.workspace_key.is_none() {
+            self.workspace_key = branch.workspace_key.clone();
+        }
+        if self.workspace_label.is_none() {
+            self.workspace_label = branch.workspace_label.clone();
+        }
+        for agent in &branch.agents {
+            if !self.agents.contains(agent) {
+                self.agents.push(agent.clone());
+            }
         }
         for model in &branch.models {
             if !self
@@ -314,6 +335,32 @@ fn accumulate_session_entry(
         let trimmed = title.trim();
         if !trimmed.is_empty() && (owner_msg || entry.title.is_none()) {
             entry.title = Some(trimmed.to_string());
+        }
+    }
+
+    if let Some(ref wk) = msg.workspace_key {
+        let trimmed = wk.trim();
+        if !trimmed.is_empty() && (owner_msg || entry.workspace_key.is_none()) {
+            entry.workspace_key = Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref wl) = msg.workspace_label {
+        let trimmed = wl.trim();
+        if !trimmed.is_empty() && (owner_msg || entry.workspace_label.is_none()) {
+            entry.workspace_label = Some(trimmed.to_string());
+        }
+    }
+    if let Some(ref agent) = msg.agent {
+        let normalized = if msg.client == "opencode" {
+            sessions::normalize_opencode_agent_name(agent)
+        } else if msg.client == "copilot" {
+            sessions::normalize_copilot_agent_name(agent)
+        } else {
+            sessions::normalize_agent_name(agent)
+        };
+        let trimmed = normalized.trim();
+        if !trimmed.is_empty() && !entry.agents.iter().any(|a| a == trimmed) {
+            entry.agents.push(trimmed.to_string());
         }
     }
 
@@ -398,6 +445,7 @@ pub struct UsageData {
     pub sessions_rolled: Vec<SessionUsage>,
     pub graph: Option<GraphData>,
     pub total_tokens: u64,
+    pub undated_tokens: u64,
     pub total_cost: f64,
     pub loading: bool,
     pub error: Option<String>,
@@ -446,19 +494,6 @@ fn is_codex_chat_workspace(key: &str) -> bool {
 
     // A chat directory can become a real repository or a git worktree.
     !Path::new(key).join(".git").exists()
-}
-
-fn positive_unified_token_total(tokens: &tokscale_core::TokenBreakdown) -> i64 {
-    // saturating_add (mirrors tokscale_core::TokenBreakdown::total) so a
-    // clamped (i64::MAX) bucket from a corrupt source can't overflow the
-    // per-message sum.
-    tokens
-        .input
-        .max(0)
-        .saturating_add(tokens.output.max(0))
-        .saturating_add(tokens.cache_read.max(0))
-        .saturating_add(tokens.cache_write.max(0))
-        .saturating_add(tokens.reasoning.max(0))
 }
 
 fn workspace_model_display_label(workspace_label: &str, model: &str) -> String {
@@ -631,6 +666,63 @@ impl DataLoader {
         .map_err(anyhow::Error::msg)?;
 
         self.aggregate_messages(messages, group_by)
+    }
+
+    /// Build complete TUI data while leaving only the durable source-cache
+    /// write pending. The caller owns that write and must persist it on the
+    /// same background loader thread after publishing the aggregate data.
+    pub fn load_deferred(
+        &self,
+        enabled_clients: &[ClientId],
+        group_by: &GroupBy,
+        include_synthetic: bool,
+    ) -> Result<(UsageData, PendingSourceCacheSave)> {
+        let home = crate::paths::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+            .to_string_lossy()
+            .to_string();
+
+        let mut sources: Vec<String> = enabled_clients
+            .iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        if include_synthetic {
+            sources.push("synthetic".to_string());
+        }
+
+        let opts = LocalParseOptions {
+            home_dir: Some(home),
+            use_env_roots: true,
+            clients: Some(sources),
+            since: self.since.clone(),
+            until: self.until.clone(),
+            year: self.year.clone(),
+            scanner_settings: data_loader_scanner_settings(),
+        };
+
+        let (messages, pending_save) = if Handle::try_current().is_ok() {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = Runtime::new().map_err(|e| e.to_string())?;
+                    rt.block_on(parse_local_unified_messages_deferred(opts))
+                })
+                .join()
+                .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
+            })
+        } else {
+            Runtime::new()?.block_on(parse_local_unified_messages_deferred(opts))
+        }
+        .map_err(anyhow::Error::msg)?;
+
+        match self.aggregate_messages(messages, group_by) {
+            Ok(data) => Ok((data, pending_save)),
+            Err(error) => {
+                // Parsing has already mutated the owned source cache. Do not
+                // throw that work away merely because TUI aggregation failed.
+                pending_save.persist();
+                Err(error)
+            }
+        }
     }
 
     #[cfg(test)]
@@ -912,7 +1004,7 @@ impl DataLoader {
             model_entry.cost += msg_cost;
             model_entry
                 .performance
-                .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
 
             if let Some(date) = parse_date(&msg.date) {
                 let model_day = model_days
@@ -952,7 +1044,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_day
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // A recovered daily floor has a synthetic session id; it adds usage
@@ -1140,7 +1232,7 @@ impl DataLoader {
                     .saturating_add(msg.message_count.max(0) as u64);
                 model_info
                     .performance
-                    .record_message(positive_unified_token_total(&msg.tokens), msg.duration_ms);
+                    .record_token_breakdown(&msg.tokens, msg.performance_duration_ms());
             }
 
             // Hourly aggregation: derive hour from timestamp (Unix ms),
@@ -1633,6 +1725,12 @@ impl DataLoader {
             sessions_rolled,
             graph: Some(graph),
             total_tokens,
+            undated_tokens: messages
+                .iter()
+                .filter(|m| tokscale_core::claude_desktop::is_undated_balance(m))
+                .fold(0u64, |total, m| {
+                    total.saturating_add(m.tokens.total().max(0) as u64)
+                }),
             total_cost,
             loading: false,
             error: None,
@@ -1995,6 +2093,46 @@ mod tests {
     use tokscale_core::TokenBreakdown as CoreTokenBreakdown;
 
     #[test]
+    fn accumulate_session_entry_normalizes_and_deduplicates_agents() {
+        let mut entry = SessionUsage::new("opencode", "sess-test");
+        let mut msg = UnifiedMessage {
+            client: "opencode".to_string(),
+            model_id: "test-model".to_string(),
+            provider_id: "test-provider".to_string(),
+            session_id: "sess-test".to_string(),
+            workspace_key: Some("/path/to/project".to_string()),
+            workspace_label: Some("project".to_string()),
+            timestamp: 1_700_000_000,
+            date: "2023-11-14".to_string(),
+            tokens: tokscale_core::TokenBreakdown::default(),
+            cost: 0.0,
+            cost_source: tokscale_core::sessions::CostSource::default(),
+            service_tier: None,
+            duration_ms: None,
+            performance_timing: None,
+            message_count: 1,
+            agent: Some("hephaestus".to_string()),
+            dedup_key: None,
+            session_title: None,
+            parent_session_id: None,
+            is_turn_start: false,
+            model_attribution_conflicted: false,
+            billing_identity: tokscale_core::sessions::BillingIdentity::Unknown,
+            pricing_model_id: None,
+            estimate_status: tokscale_core::sessions::EstimateStatus::Unpriced,
+            copilot_context: None,
+        };
+
+        accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);
+        assert_eq!(entry.agents, vec!["Hephaestus".to_string()]);
+
+        // Duplicate with variant formatting doesn't add duplicate
+        msg.agent = Some(" Hephaestus ".to_string());
+        accumulate_session_entry(&mut entry, &msg, 0.0, "test-model", "test-model", true);
+        assert_eq!(entry.agents, vec!["Hephaestus".to_string()]);
+    }
+
+    #[test]
     fn find_peak_hour_breaks_token_ties_by_earliest_hour() {
         let date = NaiveDate::from_ymd_opt(2026, 5, 29).unwrap();
         let hour = |h: u32, tokens: u64| HourlyUsage {
@@ -2021,6 +2159,35 @@ mod tests {
     }
 
     #[test]
+    fn desktop_undated_balances_appear_in_models_but_not_calendar() {
+        let mut message = UnifiedMessage::new(
+            "claude",
+            "claude-future",
+            "anthropic",
+            "s",
+            0,
+            CoreTokenBreakdown {
+                input: 100,
+                ..Default::default()
+            },
+            0.0,
+        );
+        message.date = tokscale_core::claude_desktop::UNKNOWN_DATE.into();
+        message.message_count = 0;
+        let loader = DataLoader::new(None).with_minutely_enabled(true);
+        let data = loader
+            .aggregate_messages(vec![message], &GroupBy::Model)
+            .unwrap();
+        assert_eq!(data.total_tokens, 100);
+        assert_eq!(data.undated_tokens, 100);
+        assert_eq!(data.models.len(), 1);
+        assert!(data.daily.is_empty());
+        assert!(data.hourly.is_empty());
+        assert!(data.minutely.is_empty());
+        assert!(data.monthly.is_empty());
+    }
+
+    #[test]
     fn positive_unified_token_total_saturates_instead_of_overflowing() {
         // tokscale-core clamps corrupt per-field token buckets to i64::MAX; a
         // plain `+` fold over two clamped buckets would panic in debug builds.
@@ -2032,7 +2199,9 @@ mod tests {
             cache_write_1h: 0,
             reasoning: 0,
         };
-        assert_eq!(positive_unified_token_total(&tokens), i64::MAX);
+        let mut performance = ModelPerformance::default();
+        performance.record_token_breakdown(&tokens, Some(100));
+        assert_eq!(performance.timed_tokens, i64::MAX);
     }
 
     fn test_pricing_service() -> PricingService {
@@ -2222,6 +2391,8 @@ mod tests {
         assert_eq!(clients[53], ClientId::MiMoDesktop);
         assert_eq!(clients[54], ClientId::Muse);
         assert_eq!(clients[55], ClientId::AntigravityExtension);
+        assert_eq!(clients[56], ClientId::Aside);
+        assert_eq!(clients[57], ClientId::Vibe);
     }
 
     #[test]
@@ -2283,6 +2454,8 @@ mod tests {
             "Xiaomi MiMo AI",
             "Muse Code",
             "Antigravity IDE Extension",
+            "Aside",
+            "Mistral Vibe",
         ];
 
         assert_eq!(expected.len(), ClientId::COUNT);
@@ -2335,14 +2508,20 @@ mod tests {
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Hindsight), 'H');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::MiMoDesktop), 'W');
         assert_eq!(crate::tui::client_ui::hotkey(ClientId::Muse), 'N');
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Aside), 'V');
         assert_eq!(
             crate::tui::client_ui::hotkey(ClientId::AntigravityExtension),
             'I'
         );
+        assert_eq!(crate::tui::client_ui::hotkey(ClientId::Vibe), 'T');
     }
 
     #[test]
     fn test_client_from_key() {
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('V'),
+            Some(ClientId::Aside)
+        );
         assert_eq!(
             crate::tui::client_ui::from_hotkey('1'),
             Some(ClientId::OpenCode)
@@ -2458,6 +2637,10 @@ mod tests {
         assert_eq!(
             crate::tui::client_ui::from_hotkey('P'),
             Some(ClientId::PrimeAgent)
+        );
+        assert_eq!(
+            crate::tui::client_ui::from_hotkey('T'),
+            Some(ClientId::Vibe)
         );
     }
 
@@ -3899,72 +4082,169 @@ after"#,
         )
         .unwrap();
 
-        let architect_expected = expected_message_cost(
-            &pricing,
-            "claude-sonnet-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 420_000,
-                output: 120_000,
-                cache_read: 32_000,
-                cache_write: 0,
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-        ) + expected_message_cost(
-            &pricing,
-            "claude-sonnet-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 90_000,
-                output: 60_000,
-                cache_read: 12_000,
-                cache_write: 0,
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-        );
-        let reviewer_expected = expected_message_cost(
-            &pricing,
-            "claude-haiku-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 70_000,
-                output: 26_000,
-                cache_read: 8_000,
-                cache_write: 0,
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-        ) + expected_message_cost(
-            &pricing,
-            "claude-haiku-4",
-            "anthropic",
-            CoreTokenBreakdown {
-                input: 22_000,
-                output: 18_000,
-                cache_read: 3_000,
-                cache_write: 0,
-                cache_write_1h: 0,
-                reasoning: 0,
-            },
-        );
+        // The task log records a positive per-request `cost`, which is now
+        // kept as the client's own charge instead of being re-estimated, so
+        // the agent total is the sum of the logged values. `tokensIn` is gross
+        // of cache on these rows, so input is the residual and the cache
+        // buckets are counted once: (420k-32k)+120k+32k + (90k-12k)+60k+12k.
+        let architect_expected = 8.4 + 3.1;
+        let reviewer_expected = 1.8 + 0.9;
 
         assert_eq!(usage.agents.len(), 2);
         assert_eq!(usage.agents[0].agent, "Architect");
         assert_eq!(usage.agents[0].clients, "roocode");
         assert_eq!(usage.agents[0].message_count, 2);
         assert_cost_matches(usage.agents[0].cost, architect_expected);
-        assert_eq!(usage.agents[0].tokens.total(), 734_000);
+        assert_eq!(usage.agents[0].tokens.total(), 690_000);
 
         assert_eq!(usage.agents[1].agent, "Reviewer");
         assert_eq!(usage.agents[1].message_count, 2);
         assert_cost_matches(usage.agents[1].cost, reviewer_expected);
-        assert_eq!(usage.agents[1].tokens.total(), 147_000);
+        assert_eq!(usage.agents[1].tokens.total(), 136_000);
 
         match previous_home {
             Some(home) => unsafe { env::set_var("HOME", home) },
             None => unsafe { env::remove_var("HOME") },
+        }
+    }
+
+    /// OpenClaw drives a Codex thread in the user's `~/.codex` that spawns a
+    /// subagent; both rollouts carry OpenClaw's originator, and OpenClaw
+    /// mirrors the parent's turn into its own session through
+    /// `codex-app-server:<thread>:<turn>`. The parent turn is 100/30
+    /// input/output, the child's 41/13.
+    fn write_openclaw_codex_parent_with_subagent(home: &std::path::Path) {
+        let parent = "0192f3a4-5b6c-7d8e-9f01-23456789abcd";
+        let child = "0192f3a5-0000-7000-8000-00000000cccc";
+        let rollout = |thread: &str, source: &str, turn: &str, minute: u32, usage: (i64, i64)| {
+            [
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:00Z","type":"session_meta","payload":{{"id":"{thread}","originator":"openclaw","source":{source},"model_provider":"openai","cwd":"/repo"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:01Z","type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn}"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:01Z","type":"turn_context","payload":{{"turn_id":"{turn}","model":"gpt-5.2-codex"}}}}"#
+                ),
+                format!(
+                    r#"{{"timestamp":"2026-10-10T10:{minute:02}:02Z","type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":{{"input_tokens":{i},"output_tokens":{o}}},"last_token_usage":{{"input_tokens":{i},"output_tokens":{o}}}}}}}}}"#,
+                    i = usage.0,
+                    o = usage.1
+                ),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let sessions = home.join(".codex/sessions/2026/10/10");
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(
+            sessions.join(format!("rollout-2026-10-10T10-00-00-{parent}.jsonl")),
+            rollout(parent, r#""cli""#, "turn-1", 0, (100, 30)),
+        )
+        .unwrap();
+        fs::write(
+            sessions.join(format!("rollout-2026-10-10T10-05-00-{child}.jsonl")),
+            rollout(
+                child,
+                &format!(
+                    r#"{{"subagent":{{"thread_spawn":{{"parent_thread_id":"{parent}","depth":1}}}}}}"#
+                ),
+                "turn-c1",
+                5,
+                (41, 13),
+            ),
+        )
+        .unwrap();
+
+        let db_path = home.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE session_windows (
+              session_id TEXT NOT NULL PRIMARY KEY, session_key TEXT NOT NULL,
+              previous_session_id TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+              model_provider TEXT, model TEXT, agent_harness_id TEXT
+            ) STRICT;
+            CREATE TABLE transcript_events (
+              session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL,
+              created_at INTEGER NOT NULL, PRIMARY KEY (session_id, seq)
+            ) STRICT;
+            CREATE TABLE transcript_event_identities (
+              session_id TEXT NOT NULL, event_id TEXT NOT NULL, seq INTEGER NOT NULL,
+              event_type TEXT, parent_id TEXT, message_idempotency_key TEXT,
+              created_at INTEGER NOT NULL, PRIMARY KEY (session_id, event_id)
+            ) STRICT;
+            INSERT INTO session_windows VALUES ('openclaw-visible-session', 'agent:main:openclaw-visible-session', NULL, 1791626400000, 1791626400000, 'openai', 'gpt-5.2-codex', 'codex');
+            "#,
+        )
+        .unwrap();
+        let events = [
+            r#"{"type":"session","version":3,"id":"openclaw-visible-session","timestamp":"2026-10-10T10:00:00.000Z","cwd":"/repo"}"#.to_string(),
+            format!(
+                r#"{{"type":"message","id":"m1","parentId":"u1","message":{{"role":"assistant","content":[{{"type":"text","text":"done"}}],"api":"openai-chatgpt-responses","provider":"openai","model":"gpt-5.2-codex","usage":{{"input":100,"output":30,"cacheRead":0,"cacheWrite":0,"totalTokens":130,"cost":{{"total":0}}}},"idempotencyKey":"codex-app-server:{parent}:turn-1:assistant","__openclaw":{{"mirrorOrigin":"codex-app-server","mirrorIdentity":"turn-1:assistant"}},"stopReason":"stop","timestamp":1791626402000}}}}"#
+            ),
+        ];
+        for (seq, event) in events.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO transcript_events VALUES ('openclaw-visible-session', ?1, ?2, ?3)",
+                rusqlite::params![seq as i64, event, 1_791_626_400_000_i64 + seq as i64],
+            )
+            .unwrap();
+        }
+    }
+
+    /// The subagent roll-up joins a child to its parent by session id, so an
+    /// OpenClaw-owned Codex child must name the OpenClaw session its parent's
+    /// rows are keyed by. Cold and warm cache agree.
+    #[test]
+    #[serial]
+    fn test_data_loader_rolls_openclaw_codex_subagent_into_the_mirroring_session() {
+        struct RestoreEnv(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(value) => unsafe { env::set_var(key, value) },
+                        None => unsafe { env::remove_var(key) },
+                    }
+                }
+            }
+        }
+        let temp_dir = TempDir::new().unwrap();
+        let _restore = RestoreEnv(
+            ["HOME", "TOKSCALE_CONFIG_DIR", "CODEX_HOME"]
+                .into_iter()
+                .map(|key| (key, env::var_os(key)))
+                .collect(),
+        );
+        write_openclaw_codex_parent_with_subagent(temp_dir.path());
+        unsafe {
+            env::set_var("HOME", temp_dir.path());
+            env::set_var(
+                "TOKSCALE_CONFIG_DIR",
+                temp_dir.path().join(".config/tokscale"),
+            );
+            env::remove_var("CODEX_HOME");
+        }
+
+        for pass in ["cold", "warm"] {
+            let usage = load_with_pricing(
+                &DataLoader::new(None),
+                &[ClientId::Codex, ClientId::OpenClaw],
+                &GroupBy::Model,
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(usage.sessions.len(), 2, "{pass}: the flat view keeps both");
+            assert_eq!(usage.sessions_rolled.len(), 1, "{pass}: one rolled row");
+            let parent = &usage.sessions_rolled[0];
+            assert_eq!(parent.session_id, "openclaw-visible-session", "{pass}");
+            assert_eq!(parent.subagent_count, 1, "{pass}");
+            assert_eq!(parent.tokens.input, 141, "{pass}");
+            assert_eq!(parent.tokens.output, 43, "{pass}");
         }
     }
 
