@@ -9,7 +9,10 @@
 //! `OpenCodeSchemaConfig::codearts`. Like every owned client, the database is
 //! re-read on each scan — the message-cache lane is keyed on `ClientId`, which
 //! owned ids are not — and the store is small enough that this is cheap.
+//! `TOKEN_MONITOR_CODEARTS_DB_PATH` overrides the default store only when the
+//! scan allows environment roots; an explicit `--home` stays under that home.
 
+use super::Scope;
 use crate::sessions::opencode_schema::{parse_opencode_schema_sqlite, OpenCodeSchemaConfig};
 use crate::sessions::UnifiedMessage;
 use std::path::{Path, PathBuf};
@@ -18,16 +21,19 @@ pub const CLIENT_ID: &str = "codearts";
 
 const DB_SUFFIX: [&str; 2] = ["codearts-data", "opencode.db"];
 
-pub fn parse(home_dir: &str) -> Vec<UnifiedMessage> {
-    parse_db(&db_path(Path::new(home_dir)))
+pub fn parse(scope: &Scope) -> Vec<UnifiedMessage> {
+    parse_db(&db_path(Path::new(scope.home_dir), scope.use_env_roots))
 }
 
-fn db_path(home: &Path) -> PathBuf {
-    env_path("TOKEN_MONITOR_CODEARTS_DB_PATH").unwrap_or_else(|| {
-        DB_SUFFIX
-            .iter()
-            .fold(home.join(".codeartsdoer"), |path, part| path.join(part))
-    })
+fn db_path(home: &Path, use_env_roots: bool) -> PathBuf {
+    if use_env_roots {
+        if let Some(path) = env_path("TOKEN_MONITOR_CODEARTS_DB_PATH") {
+            return path;
+        }
+    }
+    DB_SUFFIX
+        .iter()
+        .fold(home.join(".codeartsdoer"), |path, part| path.join(part))
 }
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -80,7 +86,13 @@ mod tests {
         conn.execute(
             "INSERT INTO message (id, session_id, data, time_created, time_updated)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![row_id, session_id, data_json, 1790871400715_i64, 1790871409590_i64],
+            params![
+                row_id,
+                session_id,
+                data_json,
+                1790871400715_i64,
+                1790871409590_i64
+            ],
         )
         .unwrap();
     }
@@ -158,10 +170,7 @@ mod tests {
         let messages = parse_db(&db_path);
         assert_eq!(messages.len(), 1);
         let msg = &messages[0];
-        assert_eq!(
-            (msg.tokens.input, msg.tokens.output),
-            (10, 5)
-        );
+        assert_eq!((msg.tokens.input, msg.tokens.output), (10, 5));
         assert_eq!(msg.tokens.cache_read, 0);
         assert_eq!(msg.tokens.cache_write, 0);
     }
@@ -171,9 +180,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let db_path = create_codearts_db(&dir);
         let conn = Connection::open(&db_path).unwrap();
-        insert_message(&conn, "msg_3", "ses_1", &assistant_payload(
-            r#"{"input": 7, "output": 3, "cache": {"write": 0, "read": 0}}"#,
-        ));
+        insert_message(
+            &conn,
+            "msg_3",
+            "ses_1",
+            &assistant_payload(r#"{"input": 7, "output": 3, "cache": {"write": 0, "read": 0}}"#),
+        );
         insert_message(
             &conn,
             "msg_user",

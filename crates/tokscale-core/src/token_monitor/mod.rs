@@ -45,7 +45,7 @@ struct Client {
 const CLIENTS: &[Client] = &[
     Client {
         id: codearts::CLIENT_ID,
-        parse: |scope| codearts::parse(scope.home_dir),
+        parse: codearts::parse,
     },
     Client {
         id: catpaw::CLIENT_ID,
